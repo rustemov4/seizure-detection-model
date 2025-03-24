@@ -10,10 +10,11 @@ from scipy.signal import butter, filtfilt
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              mean_squared_error, mean_absolute_error, r2_score, confusion_matrix)
+from sklearn.decomposition import FastICA  # For ICA
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (Conv1D, MaxPooling1D, Flatten, Dense, Dropout,
-                                     BatchNormalization, LSTM, GRU, Input)
+                                     BatchNormalization, LSTM, Input)
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 import matplotlib.pyplot as plt
 
@@ -29,14 +30,44 @@ STD_MIN = 1e-5
 STD_MAX = 1e5
 CORRELATION_THRESHOLD = 0.88
 WINDOW_SIZE = 512  # Window length in samples
-OVERLAP = 0      # Overlap between windows (in samples)
+OVERLAP = 0  # Overlap between windows (in samples)
 SEIZURE_THRESHOLD = 0.6  # Window label = 1 if mean seizure value > threshold
 DEBUG = True
+
 
 def debug_print(message):
     if DEBUG:
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"[DEBUG {now}] {message}")
+
+
+# ------------------------------
+# Custom Attention Layer
+# ------------------------------
+class Attention(tf.keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(Attention, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        # input_shape: (batch, time_steps, features)
+        self.W = self.add_weight(name="att_weight",
+                                 shape=(input_shape[-1], input_shape[-1]),
+                                 initializer="random_normal",
+                                 trainable=True)
+        self.b = self.add_weight(name="att_bias",
+                                 shape=(input_shape[-1],),
+                                 initializer="zeros",
+                                 trainable=True)
+        super(Attention, self).build(input_shape)
+
+    def call(self, x):
+        # Calculate attention scores
+        e = tf.nn.tanh(tf.tensordot(x, self.W, axes=1) + self.b)
+        a = tf.nn.softmax(e, axis=1)
+        # Multiply attention weights with the inputs to get context vector
+        output = tf.reduce_sum(x * a, axis=1)
+        return output
+
 
 # ------------------------------
 # Signal Preprocessing Functions
@@ -49,6 +80,26 @@ def bandpass_filter(data, lowcut=1, highcut=50.0, fs=512, order=5):
     high = highcut / nyquist
     b, a = butter(order, [low, high], btype='band')
     return filtfilt(b, a, data)
+
+
+def apply_ica_to_df(df, n_components=None):
+    """
+    Applies Independent Component Analysis (ICA) to the EEG channels in the DataFrame.
+    The EEG columns (all except "Seizure") are processed and then reconstructed.
+    """
+    debug_print("Applying ICA to remove artifacts.")
+    eeg_columns = [col for col in df.columns if col != "Seizure"]
+    signals = df[eeg_columns].values
+    # Set n_components to number of channels if not provided
+    n_components = n_components if n_components is not None else len(eeg_columns)
+    ica = FastICA(n_components=n_components, random_state=42)
+    sources = ica.fit_transform(signals)
+    signals_reconstructed = ica.inverse_transform(sources)
+    df_ica = pd.DataFrame(signals_reconstructed, columns=eeg_columns)
+    df_ica["Seizure"] = df["Seizure"].values
+    debug_print("ICA applied, signals reconstructed.")
+    return df_ica
+
 
 # ------------------------------
 # Data Processing Functions
@@ -66,9 +117,11 @@ def drop_highly_correlated_features(df, threshold=CORRELATION_THRESHOLD):
         debug_print("No highly correlated columns found.")
     return df
 
+
 def load_seizure_data(csv_path):
     debug_print(f"Loading seizure data from {csv_path}")
     BASE_DATE = datetime(2024, 1, 1)
+
     def convert_time(time_str):
         for fmt in ("%H:%M:%S", "%H:%M.%S", "%H.%M:%S", "%H.%M.%S"):
             try:
@@ -77,6 +130,7 @@ def load_seizure_data(csv_path):
             except ValueError:
                 continue
         return None
+
     df = pd.read_csv(csv_path)
     df["File Name"] = df["File Name"].str.strip().str.lower()
     df["Registration Start Time"] = df["Registration Start Time"].apply(convert_time)
@@ -85,6 +139,7 @@ def load_seizure_data(csv_path):
     df.dropna(inplace=True)
     debug_print(f"Seizure data loaded with {len(df)} records.")
     return df
+
 
 def get_common_channels(folder_path, common_channels_csv="common_channels.csv"):
     debug_print(f"Searching for common EEG channels in folder: {folder_path}")
@@ -105,6 +160,7 @@ def get_common_channels(folder_path, common_channels_csv="common_channels.csv"):
     else:
         debug_print("No common EEG channels found.")
         return []
+
 
 def process_and_save_edf(folder_path, seizure_data, common_channels, output_dir=RES_DIR):
     """
@@ -189,6 +245,7 @@ def process_and_save_edf(folder_path, seizure_data, common_channels, output_dir=
         debug_print(f"After correlation drop, data has {merged_df.shape[1] - 1} EEG channels.")
     return merged_df
 
+
 def extract_raw_windows_from_df(df, window_size=WINDOW_SIZE, overlap=OVERLAP, seizure_threshold=SEIZURE_THRESHOLD):
     """
     Splits the merged dataframe into raw EEG windows and computes a window label based on
@@ -207,12 +264,12 @@ def extract_raw_windows_from_df(df, window_size=WINDOW_SIZE, overlap=OVERLAP, se
         window_seizure = y[start:start + window_size]
         label = 1 if np.mean(window_seizure) > seizure_threshold else 0
         labels_list.append(label)
-        # Print detailed debug for first 5 windows for clarity
         if i < 5:
-            debug_print(f"Window {i+1}: Start index {start}, mean seizure value: {np.mean(window_seizure):.2f}, "
-                        f"labeled as {'Seizure' if label==1 else 'No Seizure'}.")
+            debug_print(f"Window {i + 1}: Start index {start}, mean seizure value: {np.mean(window_seizure):.2f}, "
+                        f"labeled as {'Seizure' if label == 1 else 'No Seizure'}.")
     debug_print(f"Extracted {len(raw_windows)} windows.")
     return np.array(raw_windows), np.array(labels_list)
+
 
 def balance_windows(windows, labels, ratio=3):
     """
@@ -236,17 +293,19 @@ def balance_windows(windows, labels, ratio=3):
     debug_print(f"Window counts after balancing: {dict(zip(*np.unique(balanced_labels, return_counts=True)))}")
     return balanced_windows, balanced_labels
 
+
 # ------------------------------
-# Model Building Functions
+# Model Building Functions (with Attention)
 # ------------------------------
 
 def build_cnn_model(raw_input_shape):
-    debug_print("Building CNN model for raw EEG input.")
+    debug_print("Building CNN model with attention for raw EEG input.")
     raw_input = Input(shape=raw_input_shape)
     x = Conv1D(64, kernel_size=3, activation='relu')(raw_input)
     x = BatchNormalization()(x)
     x = MaxPooling1D(pool_size=2)(x)
-    x = Flatten()(x)
+    # Add attention layer to focus on important features across time steps
+    x = Attention()(x)
     x = Dense(128, activation='relu')(x)
     x = Dropout(0.5)(x)
     output = Dense(1, activation='sigmoid')(x)
@@ -254,11 +313,12 @@ def build_cnn_model(raw_input_shape):
     model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
     return model
 
+
 def build_gru_model(raw_input_shape):
-    # This function now uses an LSTM layer instead of a GRU layer.
-    debug_print("Building LSTM (replacing GRU) model for raw EEG input.")
+    debug_print("Building LSTM (replacing GRU) model with attention for raw EEG input.")
     raw_input = Input(shape=raw_input_shape)
-    x = LSTM(64, return_sequences=False)(raw_input)  # Changed from GRU to LSTM
+    x = LSTM(64, return_sequences=True)(raw_input)
+    x = Attention()(x)
     x = Dropout(0.5)(x)
     x = Dense(64, activation='relu')(x)
     output = Dense(1, activation='sigmoid')(x)
@@ -266,19 +326,23 @@ def build_gru_model(raw_input_shape):
     model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
     return model
 
+
 def build_cnn_lstm_model(raw_input_shape):
-    debug_print("Building CNN+LSTM model for raw EEG input.")
+    debug_print("Building CNN+LSTM model with attention for raw EEG input.")
     raw_input = Input(shape=raw_input_shape)
     x = Conv1D(64, kernel_size=3, activation='relu')(raw_input)
     x = BatchNormalization()(x)
     x = MaxPooling1D(pool_size=2)(x)
-    x = LSTM(50, return_sequences=False)(x)
+    # Use return_sequences=True to enable attention after LSTM
+    x = LSTM(50, return_sequences=True)(x)
+    x = Attention()(x)
     x = Dense(64, activation='relu')(x)
     x = Dropout(0.5)(x)
     output = Dense(1, activation='sigmoid')(x)
     model = Model(inputs=raw_input, outputs=output)
     model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
     return model
+
 
 # ------------------------------
 # Helper: Plot Confusion Matrix
@@ -305,6 +369,7 @@ def plot_confusion_matrix(cm, classes, model_name, save_path):
     plt.savefig(save_path)
     plt.close()
 
+
 # ------------------------------
 # Training and Evaluation Functions
 # ------------------------------
@@ -318,7 +383,6 @@ def train_and_evaluate_model(build_model_fn, model_name, raw_data, labels):
     model = build_model_fn(raw_input_shape)
     debug_print(f"Training {model_name} with input shape {raw_input_shape}.")
 
-    # Callbacks to avoid overfitting
     early_stopping = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6)
     callbacks = [early_stopping, reduce_lr]
@@ -350,7 +414,6 @@ def train_and_evaluate_model(build_model_fn, model_name, raw_data, labels):
     pd.DataFrame([metrics]).to_csv(results_filename, index=False)
     debug_print(f"Saved {model_name} results to {results_filename}")
 
-    # Plot actual vs predicted for this model
     plt.figure(figsize=(10, 4))
     n_plot = min(50, len(y_test))
     plt.plot(y_test[:n_plot], label="Actual", marker="o")
@@ -365,13 +428,13 @@ def train_and_evaluate_model(build_model_fn, model_name, raw_data, labels):
     plt.close()
     debug_print(f"Saved actual vs predicted plot for {model_name} to {actual_vs_pred_path}")
 
-    # Compute and plot confusion matrix
     cm = confusion_matrix(y_test, y_pred)
     cm_path = os.path.join(PLOTS_DIR, f"{model_name.lower().replace(' ', '_')}_confusion_matrix.png")
     plot_confusion_matrix(cm, classes=["Non-Seizure", "Seizure"], model_name=model_name, save_path=cm_path)
     debug_print(f"Saved confusion matrix for {model_name} to {cm_path}")
 
     return metrics
+
 
 # ------------------------------
 # Main Pipeline
@@ -385,6 +448,9 @@ if __name__ == "__main__":
     if merged_df is None or merged_df.empty:
         debug_print("No processed data available. Exiting main pipeline.")
         exit()
+
+    # Apply ICA to clean EEG channels before window extraction
+    merged_df = apply_ica_to_df(merged_df)
 
     # Print sample rows for seizure and non-seizure data
     seizure_samples = merged_df[merged_df["Seizure"] == 1].sample(
@@ -410,7 +476,8 @@ if __name__ == "__main__":
     # Train and evaluate models using only raw EEG windows.
     metrics_cnn = train_and_evaluate_model(build_cnn_model, "CNN Model", balanced_windows, balanced_labels)
     metrics_gru = train_and_evaluate_model(build_gru_model, "GRU Model", balanced_windows, balanced_labels)
-    metrics_cnn_lstm = train_and_evaluate_model(build_cnn_lstm_model, "CNN+LSTM Model", balanced_windows, balanced_labels)
+    metrics_cnn_lstm = train_and_evaluate_model(build_cnn_lstm_model, "CNN+LSTM Model", balanced_windows,
+                                                balanced_labels)
 
     # Gather results into a DataFrame and plot as a table
     results = [metrics_cnn, metrics_gru, metrics_cnn_lstm]
@@ -433,5 +500,3 @@ if __name__ == "__main__":
     debug_print(f"Saved results table to {table_path}")
 
     debug_print("Training complete.")
-
-
