@@ -29,7 +29,7 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 STD_MIN = 1e-5
 STD_MAX = 1e5
 CORRELATION_THRESHOLD = 0.88
-WINDOW_SIZE = 512  # Window length in samples
+WINDOW_SIZE = 512  # Window leng    th in samples
 OVERLAP = 0  # Overlap between windows (in samples)
 SEIZURE_THRESHOLD = 0.6  # Window label = 1 if mean seizure value > threshold
 DEBUG = True
